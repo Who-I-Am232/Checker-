@@ -35,6 +35,13 @@ class Config:
     max_windows: int = 2048
     max_window_events: int = 2048
     max_sessions: int = 8
+    movement_min_delta_ms: int = 250
+    movement_max_delta_ms: int = 2500
+    movement_foot_distance_m: int = 80
+    movement_foot_speed_mps: int = 35
+    movement_vehicle_distance_m: int = 200
+    movement_vehicle_speed_mps: int = 200
+    movement_cooldown_ms: int = 30000
     allowed_prefabs: list[str] = field(default_factory=list)
     watch_prefabs: list[str] = field(default_factory=list)
     spawn_categories: list[str] = field(default_factory=lambda: ["GENERIC", "UNCLASSIFIED", "VEHICLE"])
@@ -56,12 +63,14 @@ class Config:
             raise ValueError("A prefab cannot be both allowed and watched")
         if obj.max_window_events < max(obj.spawn_threshold, obj.unattributed_threshold, obj.scan_threshold, obj.trigger_threshold, obj.damage_victims_threshold):
             raise ValueError("max_window_events is below a detection threshold")
+        if obj.movement_min_delta_ms > obj.movement_max_delta_ms:
+            raise ValueError("Movement sampling interval is reversed")
         return obj
 
 
 KINDS = {"session_start", "session_end", "heartbeat", "player_identity", "player_left",
          "entity_init", "placement", "scan_new", "scan_baseline", "scan_incomplete",
-         "explosive_damage", "explosive_trigger", "telemetry_loss"}
+         "explosive_damage", "explosive_trigger", "telemetry_loss", "movement_candidate", "movement_reset"}
 
 
 def validate(raw: Any) -> dict[str, Any]:
@@ -93,6 +102,25 @@ def validate(raw: Any) -> dict[str, Any]:
             raise ValueError(f"Invalid {key}")
     if event["kind"] in {"entity_init", "placement", "scan_new", "explosive_damage", "explosive_trigger"} and not event["entity"]:
         raise ValueError("Entity observation has no entity ID")
+    if event["kind"] == "movement_candidate":
+        if not event["entity"] or event["actor_id"] <= 0 or event["attribution"] != "server_movement_sample":
+            raise ValueError("Movement observation needs server control attribution")
+        if event.get("motion_mode") not in {"FOOT", "VEHICLE"}:
+            raise ValueError("Invalid movement mode")
+        if type(event.get("delta_ms")) is not int or not 0 < event["delta_ms"] <= event["t_ms"]:
+            raise ValueError("Invalid movement interval")
+        if type(event.get("inst_speed_valid")) is not bool:
+            raise ValueError("Invalid physics speed flag")
+        for key in ("from_x", "from_y", "from_z", "distance_m", "avg_speed_mps", "inst_speed_mps"):
+            value = event.get(key)
+            if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 1e15:
+                raise ValueError(f"Invalid movement field: {key}")
+        distance = math.dist([event[k] for k in ("from_x", "from_y", "from_z")], [event[k] for k in ("x", "y", "z")])
+        speed = distance * 1000 / event["delta_ms"]
+        if (not math.isclose(event["distance_m"], distance, rel_tol=0.001, abs_tol=0.1)
+                or not math.isclose(event["avg_speed_mps"], speed, rel_tol=0.001, abs_tol=0.1)
+                or event["inst_speed_mps"] < 0):
+            raise ValueError("Inconsistent movement measurements")
     return event
 
 
@@ -184,11 +212,38 @@ class Analyzer:
             self._window(s, e, "explosive_trigger_burst", self.config.trigger_window_ms,
                          self.config.trigger_threshold,
                          "Many distinct explosive devices triggered; includes legitimate demolitions", "medium")
+        elif kind == "movement_candidate" and not e["warmup"]:
+            self._movement(s, e)
 
         self._finalize(sid, s, force=kind == "session_end")
         if kind == "session_end":
             s.ended = True
         self._bound(s, e)
+
+    def _movement(self, s: Session, e: dict) -> None:
+        cfg = self.config
+        if not cfg.movement_min_delta_ms <= e["delta_ms"] <= cfg.movement_max_delta_ms:
+            return
+        previous = [e[k] for k in ("from_x", "from_y", "from_z")]
+        current = [e[k] for k in ("x", "y", "z")]
+        distance = math.dist(previous, current)
+        speed = distance * 1000 / e["delta_ms"]
+        vehicle = e["motion_mode"] == "VEHICLE"
+        min_distance = cfg.movement_vehicle_distance_m if vehicle else cfg.movement_foot_distance_m
+        min_speed = cfg.movement_vehicle_speed_mps if vehicle else cfg.movement_foot_speed_mps
+        if distance < min_distance or speed < min_speed:
+            return
+        key = ("movement_anomaly", e["actor_uid"] or str(e["actor_id"]), e["entity"])
+        if e["t_ms"] < s.cooldowns.get(key, -1):
+            return
+        s.cooldowns[key] = e["t_ms"] + cfg.movement_cooldown_ms
+        self._alert(e, "movement_anomaly", "medium",
+                    "Abrupt server-observed displacement; verify legitimate teleport, physics and replication corrections", [e],
+                    {"motion_mode": e["motion_mode"], "distance_m": round(distance, 3),
+                     "time_delta_s": e["delta_ms"] / 1000, "avg_speed_mps": round(speed, 3),
+                     "inst_speed_mps": round(e["inst_speed_mps"], 3) if e["inst_speed_valid"] else None,
+                     "from_position": previous, "to_position": current,
+                     "tracked_entity": e["entity"], "controlled_entity": e["source_entity"]})
 
     def _remember(self, s: Session, e: dict) -> None:
         s.entities[e["entity"]] = e
@@ -291,12 +346,14 @@ class Analyzer:
         s.windows = {k: v for k, v in s.windows.items() if v and s.now - v[-1]["t_ms"] <= keep}
         s.cooldowns = {k: v for k, v in s.cooldowns.items() if v >= s.now}
 
-    def _alert(self, e: dict, rule: str, severity: str, reason: str, evidence: list[dict]) -> None:
+    def _alert(self, e: dict, rule: str, severity: str, reason: str, evidence: list[dict], metrics: dict | None = None) -> None:
         seqs = sorted({item["seq"] for item in evidence})
         token = json.dumps([e["session"], rule, seqs], separators=(",", ":"))
         actors: dict[tuple, dict] = {}
         for item in evidence:
-            if item["actor_id"] <= 0 or item["attribution"] not in {"server_action_callback", "engine_instigator"}:
+            if rule in {"coverage_gap", "sequence_gap", "collector_silent"}:
+                continue  # The last observed player did not cause a telemetry outage.
+            if item["actor_id"] <= 0 or item["attribution"] not in {"server_action_callback", "engine_instigator", "server_movement_sample"}:
                 continue
             key = (item["actor_id"], item["actor_uid"], item["attribution"])
             actors[key] = {"player_id": item["actor_id"], "uid": item["actor_uid"],
@@ -313,6 +370,9 @@ class Analyzer:
             "samples": [{k: v[k] for k in ("seq", "entity", "prefab", "source", "attribution")}
                         for v in evidence[:8]],
         }
+        if metrics is not None:
+            alert["metrics"] = metrics
+            alert["actor_caution"] = "Movement identifies the observed character/driver, not the cause of the displacement or cheat software."
         self.alert_count += 1
         self.emit(alert)
 

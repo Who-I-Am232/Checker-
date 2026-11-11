@@ -15,6 +15,10 @@ class CA_Settings
 	static const int QUERY_BUDGET_MS = 3;
 	static const int REBASE_AFTER_MS = 120000;
 	static const bool SCANNER_ENABLED = true;
+	static const bool MOVEMENT_ENABLED = true;
+	static const int MAX_MOVEMENT_PLAYERS = 256;
+	static const int MOVEMENT_GRACE_MS = 10000;
+	static const int MOVEMENT_MAX_GAP_MS = 2500;
 }
 
 class CA_Event
@@ -37,6 +41,13 @@ class CA_Event
 	float amount;
 	int count;
 	bool warmup;
+	string motion_mode;
+	vector from_position;
+	int delta_ms;
+	float distance_m;
+	float avg_speed_mps;
+	float inst_speed_mps;
+	bool inst_speed_valid;
 
 	// Temporary weak engine reference, never serialized. Used to obtain the final
 	// transform after spawning completes. Damage positions remain event-time values.
@@ -67,6 +78,18 @@ class CA_Event
 		json.WriteValue("amount", amount);
 		json.WriteValue("count", count);
 		json.WriteValue("warmup", warmup);
+		if (kind == "movement_candidate")
+		{
+			json.WriteValue("motion_mode", motion_mode);
+			json.WriteValue("from_x", from_position[0]);
+			json.WriteValue("from_y", from_position[1]);
+			json.WriteValue("from_z", from_position[2]);
+			json.WriteValue("delta_ms", delta_ms);
+			json.WriteValue("distance_m", distance_m);
+			json.WriteValue("avg_speed_mps", avg_speed_mps);
+			json.WriteValue("inst_speed_mps", inst_speed_mps);
+			json.WriteValue("inst_speed_valid", inst_speed_valid);
+		}
 		string line = json.SaveToString();
 		// The serializer escapes control characters inside strings. Remove only
 		// formatting newlines, so one event occupies one physical line.

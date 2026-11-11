@@ -18,6 +18,7 @@ class CA_Runtime
 	protected bool m_StorageStopped;
 	protected string m_Session;
 	protected string m_Path;
+	protected ref CA_MovementSampler m_Movement;
 
 	static CA_Runtime Get()
 	{
@@ -52,6 +53,7 @@ class CA_Runtime
 	protected void Begin()
 	{
 		m_StartTick = System.GetTickCount();
+		m_Movement = new CA_MovementSampler();
 		m_Session = string.Format("%1-%2-%3", System.GetUnixTime(), m_StartTick, Math.RandomInt(1, 1000000000));
 		FileIO.MakeDirectory("$profile:ConflictAudit");
 		SelectFile();
@@ -130,6 +132,48 @@ class CA_Runtime
 		SetActor(event, playerID, "identity_only");
 		Enqueue(event);
 		m_Identity.Remove(playerID);
+		if (m_Movement)
+			m_Movement.Forget(playerID);
+	}
+
+	string GetAuditedIdentity(int playerID)
+	{
+		return m_Identity.Get(playerID);
+	}
+
+	// Call only from a server-side, permission-validated legitimate teleport path.
+	// This method is deliberately not exposed as an RPC or a player command.
+	void AllowMovementReset(int playerID, int durationMs, string reason)
+	{
+		if (!Replication.IsServer() || !m_Movement || playerID <= 0)
+			return;
+		m_Movement.Suppress(playerID, Now() + Math.Clamp(durationMs, 1000, 60000));
+		CA_Event event = NewEvent("movement_reset", "authorized_server_adapter");
+		event.category = reason;
+		SetActor(event, playerID, "server_action_callback");
+		Enqueue(event);
+	}
+
+	void ObserveMovement(int playerID, IEntity controlled, IEntity tracked, vector previous, int elapsed, int sampleTime, string mode)
+	{
+		CA_Event event = NewEvent("movement_candidate", "movement_sampler");
+		Snapshot(event, tracked);
+		event.source_entity = EntityKey(controlled);
+		event.t_ms = sampleTime;
+		event.from_position = previous;
+		event.delta_ms = elapsed;
+		event.motion_mode = mode;
+		event.distance_m = vector.Distance(previous, event.position);
+		event.avg_speed_mps = event.distance_m * 1000 / elapsed;
+		Physics physics = tracked.GetPhysics();
+		if (physics)
+		{
+			event.inst_speed_valid = true;
+			event.inst_speed_mps = vector.Distance(vector.Zero, physics.GetVelocity());
+		}
+		SetActor(event, playerID, "server_movement_sample");
+		// Keep the measured position; never replace it with a later flush position.
+		Enqueue(event);
 	}
 
 	protected void SetActor(CA_Event event, int playerID, string attribution)
@@ -233,6 +277,8 @@ class CA_Runtime
 			return;
 		// Drain before scanning to keep telemetry lag bounded during a spawn burst.
 		Flush(CA_Settings.MAX_EVENTS_PER_TICK);
+		if (CA_Settings.MOVEMENT_ENABLED && m_Movement && !m_StorageStopped)
+			m_Movement.Sample(this);
 		if (CA_Settings.SCANNER_ENABLED && m_Queue.Count() < CA_Settings.MAX_QUEUE / 2)
 			ScanOneCell();
 		if (Now() - m_LastHeartbeat >= 10000)

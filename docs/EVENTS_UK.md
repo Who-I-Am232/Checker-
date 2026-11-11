@@ -14,8 +14,8 @@
 | `x`, `y`, `z` | Світові координати в метрах; Y — висота |
 | `actor_id` | Повідомлений session player ID, 0 — невідомий |
 | `actor_uid`, `actor_name` | Тільки коли доступне доречне серверне зіставлення; можуть бути порожні |
-| `attribution` | unknown, server_action_callback, engine_instigator, identity_only |
-| `source_entity` | ID джерела damage, якщо наданий контекстом |
+| `attribution` | unknown, server_action_callback, engine_instigator, identity_only, server_movement_sample |
+| `source_entity` | ID джерела damage або контрольованого персонажа для movement |
 | `amount` | damageValue контексту, не гарантована остаточна втрата health |
 | `count` | Лічильник для heartbeat/baseline/втрати даних |
 | `warmup` | Подія в початковому вікні відновлення |
@@ -41,3 +41,35 @@ callback damage manager для EDamageType.EXPLOSIVE, іноді багато ca
 Формат не призначений для приймання довільних клієнтських повідомлень: аналізатор
 має отримувати лише журнал встановленого серверного колектора. Підроблений
 server-side файл може підробити будь-яку записану атрибуцію.
+
+## Переміщення
+
+`movement_candidate` — дві серверні позиції того самого персонажа або його
+транспортного засобу після перевірки стабільності стану. У `entity` зберігається
+об'єкт, чий рух вимірювали; у `source_entity` — контрольований персонаж.
+Його позиція фіксується під час вимірювання й не уточнюється при flush.
+
+| Додаткове поле | Значення |
+|---|---|
+| `motion_mode` | FOOT або VEHICLE; VEHICLE тільки для місця водія/пілота |
+| `from_x`, `from_y`, `from_z` | Попередня позиція в метрах |
+| `delta_ms` | Фактична різниця часу двох вимірів, не припущення про рівно 1 с |
+| `distance_m` | Евклідова 3D-відстань між позиціями, не довжина маршруту |
+| `avg_speed_mps` | distance / фактичний інтервал у секундах |
+| `inst_speed_mps`, `inst_speed_valid` | Модуль Physics.GetVelocity та доступність цього виміру |
+
+Аналізатор повторно обчислює відстань/середню швидкість з координат та відхиляє
+неузгоджені або нечислові значення. У `movement_anomaly.metrics` є `motion_mode`,
+`distance_m`, `time_delta_s`, `avg_speed_mps`, `inst_speed_mps`, `from_position`,
+`to_position`, `tracked_entity`, `controlled_entity`. Недоступна фізична швидкість
+передається як JSON `null`, а не як 0. Приклад: `examples/alerts-movement.jsonl`.
+
+`movement_reset` — аудит виклику серверного адаптера легального переміщення;
+`category` містить причину. Скидання стану виконується в моді до вимірювання,
+а не шляхом видалення вже записаних alerts. Зміна персонажа/транспорту, втрата
+контролю, seat transition і часовий розрив також скидають baseline у моді,
+але не генерують окремого movement_reset на кожен tick.
+
+Discord payload не є raw-доказом. Він містить короткий виклад і `alert_id`;
+повна кореляція доступна в локальному alert і raw-файлі. `server-id` задається
+під час запуску notifier та разом з `alert_id` утворює ключ дедуплікації.

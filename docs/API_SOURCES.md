@@ -50,5 +50,26 @@ Additional official references:
 - [Scripting performance guidance](https://community.bistudio.com/wiki/Arma_Reforger:Scripting_Performance)
 - [Script profiling](https://community.bistudio.com/wiki/Arma_Reforger:Script_Profiling)
 
+Movement sampler references inspected for this extension:
+
+- [CompartmentAccessComponent](https://community.bistudio.com/wikidata/external-data/arma-reforger/ArmaReforgerScriptAPIPublic/interfaceCompartmentAccessComponent.html):
+  `GetCompartment()`, `IsGettingIn()`, `IsGettingOut()`, `IsSwitchingSeatsAnim()`.
+- [PilotCompartmentSlot](https://community.bistudio.com/wikidata/external-data/arma-reforger/ArmaReforgerScriptAPIPublic/interfacePilotCompartmentSlot.html):
+  driving/pilot slot; inherited `GetVehicle()`. The base game mode above also
+  uses a PilotCompartmentSlot cast when handling a player's vehicle.
+- [Physics](https://community.bistudio.com/wikidata/external-data/arma-reforger/EnfusionScriptAPIPublic/interfacePhysics.html):
+  `GetVelocity()` returns the linear velocity vector.
+
+Discord integration follows the official API documentation:
+
+- [Execute Webhook](https://docs.discord.com/developers/resources/webhook#execute-webhook):
+  content limit, `allowed_mentions`, and `wait=true` for a returned message.
+- [Rate limits](https://docs.discord.com/developers/topics/rate-limits):
+  429 `retry_after` and rate-limit response headers. Limits are not assumed
+  constant; response instructions govern retry delays.
+
+HTTP behavior is exercised with a fake transport and a mocked HTTP opener.
+No Discord credential or live delivery was used during validation.
+
 The source files in this repository are new application code. Third-party game
 source files, binaries, credentials and actual player telemetry are not bundled.
