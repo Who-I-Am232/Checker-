@@ -1,0 +1,21 @@
+{
+  "settle_ms": 2500,
+  "spawn_window_ms": 10000,
+  "spawn_threshold": 12,
+  "unattributed_threshold": 6,
+  "scan_threshold": 8,
+  "trigger_window_ms": 5000,
+  "trigger_threshold": 6,
+  "damage_window_ms": 2000,
+  "damage_victims_threshold": 8,
+  "cell_meters": 150,
+  "cooldown_ms": 30000,
+  "max_entities": 20000,
+  "max_windows": 2048,
+  "max_window_events": 2048,
+  "max_sessions": 8,
+  "allowed_prefabs": [],
+  "watch_prefabs": [],
+  "spawn_categories": ["GENERIC", "UNCLASSIFIED", "VEHICLE"],
+  "known_routes": ["conflict_request", "editor_place"]
+}

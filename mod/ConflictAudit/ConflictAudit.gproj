@@ -1,0 +1,14 @@
+GameProject {
+ ID "ConflictAudit"
+ GUID "7F43A6D9C18E205B"
+ TITLE "Conflict Audit - observation prototype"
+ Dependencies {
+  "58D0FB3206B6F859"
+ }
+ Configurations {
+  GameProjectConfig PC {
+  }
+  GameProjectConfig HEADLESS {
+  }
+ }
+}

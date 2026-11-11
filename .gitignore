@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runtime/
+*.log
+*.zip
+mod/ConflictAudit/.cache/
+mod/ConflictAudit/.workbench/
+
