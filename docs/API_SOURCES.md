@@ -71,5 +71,19 @@ Discord integration follows the official API documentation:
 HTTP behavior is exercised with a fake transport and a mocked HTTP opener.
 No Discord credential or live delivery was used during validation.
 
+GM provenance references (same pinned game snapshot):
+
+- [Global Functions.c](https://github.com/BohemiaInteractive/Arma-Reforger-Script-Diff/blob/4317af710d2f748626e7a5e205e0990546a799e5/scripts/Game/Global/Functions.c):
+  `SCR_Global.IsAdmin` checks ADMINISTRATOR and SESSION_ADMINISTRATOR roles.
+- [SCR_EditorManagerEntity.c](https://github.com/BohemiaInteractive/Arma-Reforger-Script-Diff/blob/4317af710d2f748626e7a5e205e0990546a799e5/scripts/Game/Editor/Entities/SCR_EditorManagerEntity.c):
+  `GetPlayerID`, `FindModeEntity`, `IsLimited`, and server GAME_MASTER role assignment.
+- [SCR_EditorModeEntity.c](https://github.com/BohemiaInteractive/Arma-Reforger-Script-Diff/blob/4317af710d2f748626e7a5e205e0990546a799e5/scripts/Game/Editor/Entities/SCR_EditorModeEntity.c):
+  `GetModeType` and `IsLimited`. The placing component above checks player ID
+  against its manager before spawning, and invokes OnEntityCreatedServer afterward.
+- [Game Master FX workshop page](https://reforger.armaplatform.com/workshop/5994AD5A9F33BE57):
+  confirms the mod name, author and advertised effect types. It does not verify
+  internal callback coverage, actual installation on the target server, or our
+  compatibility. No internal FX source files were available for adapter validation.
+
 The source files in this repository are new application code. Third-party game
 source files, binaries, credentials and actual player telemetry are not bundled.

@@ -25,10 +25,12 @@ import uuid
 
 MAX_LINE = 65536
 MAX_PENDING = 10000
+OBJECT_RULES = {"spawn_burst", "unattributed_spawn_burst", "spatial_changes", "watched_prefab"}
+OBJECT_KINDS = ("VEHICLE", "BUILDING", "ENTITY", "MIXED")
 LABELS = {
     "movement_anomaly": "Підозріле переміщення / можливий телепорт",
-    "spawn_burst": "Масове створення об’єктів",
-    "unattributed_spawn_burst": "Нові об’єкти без відомого шляху створення",
+    "spawn_burst": "Підозрілий спавн: перевищено поріг кількості об’єктів",
+    "unattributed_spawn_burst": "Підозрілий спавн: шлях створення не встановлено",
     "spatial_changes": "Нові об’єкти у перевіреній зоні",
     "explosive_damage_cluster": "Сплеск вибухових пошкоджень",
     "explosive_trigger_burst": "Масове спрацювання вибухових пристроїв",
@@ -83,23 +85,88 @@ def validate_alert(value: object) -> dict:
         number_value = metrics.get(key)
         if number_value is not None and (type(number_value) not in (int, float) or abs(number_value) > 1e15 or not math.isfinite(number_value)):
             raise ValueError("Invalid movement metric")
+    if "object_kind" in metrics:
+        if metrics["object_kind"] not in OBJECT_KINDS:
+            raise ValueError("Invalid object kind")
+        counts = metrics.get("object_counts")
+        if (not isinstance(counts, dict) or set(counts) != set(OBJECT_KINDS[:3])
+                or any(type(v) is not int or not 0 <= v <= 2**31 - 1 for v in counts.values())):
+            raise ValueError("Invalid object counts")
+        if type(metrics.get("count")) is not int or metrics["count"] <= 0 or sum(counts.values()) != metrics["count"]:
+            raise ValueError("Inconsistent object counts")
+        for key in ("unknown_route_count", "unattributed_count"):
+            if type(metrics.get(key)) is not int or not 0 <= metrics[key] <= metrics["count"]:
+                raise ValueError("Invalid attribution count")
+        for key in ("window_s", "observed_rate_per_s"):
+            v = metrics.get(key)
+            if v is not None and (type(v) not in (int, float) or not 0 <= v <= 1e15 or not math.isfinite(v)):
+                raise ValueError("Invalid object metric")
+        prefabs = metrics.get("prefabs", [])
+        if not isinstance(prefabs, list) or len(prefabs) > 8:
+            raise ValueError("Invalid prefab summary")
+        for row in prefabs:
+            if (not isinstance(row, dict) or not isinstance(row.get("prefab"), str) or len(row["prefab"]) > 2048
+                    or type(row.get("count")) is not int or not 1 <= row["count"] <= metrics["count"]):
+                raise ValueError("Invalid prefab count")
+    authority = value.get("authorization")
+    if authority is not None:
+        if not isinstance(authority, dict) or authority.get("status") not in ("unverified", "gm_origin", "gm_authorized", "mixed"):
+            raise ValueError("Invalid authorization summary")
+        for key in ("authorized_count", "gm_origin_count", "unverified_count"):
+            if type(authority.get(key)) is not int or not 0 <= authority[key] <= 2**31 - 1:
+                raise ValueError("Invalid authorization count")
+        sources = authority.get("sources", [])
+        if not isinstance(sources, list) or len(sources) > 8:
+            raise ValueError("Invalid authorization sources")
+        for source in sources:
+            if not isinstance(source, dict) or source.get("role") not in ("ADMIN", "GAME_MASTER"):
+                raise ValueError("Invalid authorized role")
+            for key in ("uid", "name", "action_id", "basis", "entity"):
+                if not isinstance(source.get(key), str) or len(source[key]) > 2048:
+                    raise ValueError("Invalid authorization source text")
+        if authority["status"] == "gm_authorized" and (not authority["authorized_count"] or authority["unverified_count"] or not sources):
+            raise ValueError("Incomplete confirmed GM action")
     return value
 
 
 def payload_for(alert: dict, server_name: str) -> dict:
     validate_alert(alert)
-    lines = [f"**{clean(server_name, 80)}**", LABELS.get(alert["rule"], clean(alert["rule"]))]
+    lines = [f"**{clean(server_name, 80)}**"]
     metrics = alert.get("metrics", {})
-    mode = metrics.get("motion_mode")
-    prefix = f"[{mode}] " if mode in {"FOOT", "VEHICLE"} else ""
+    authority = alert.get("authorization", {})
+    auth_status = authority.get("status", "unverified")
+    objects = alert["rule"] in OBJECT_RULES
+    mode = metrics.get("object_kind", "ENTITY") if objects else metrics.get("motion_mode")
+    prefix = f"[{mode}] " if mode in (*OBJECT_KINDS, "FOOT") else ""
     actors = alert.get("reported_actors", [])
+    if auth_status == "gm_authorized":
+        unique = {(x.get("player_id"), x["uid"]): x for x in authority["sources"]}
+        actors = list(unique.values())
+        lines.append("Ініціатор підтвердженої GM-дії:")
     if not actors:
-        lines.append("Гравця не встановлено")
+        lines.extend([prefix + "Гравця не встановлено", "[UID невідомий]"])
     for actor in actors[:2]:
         lines.append(prefix + clean(actor.get("name") or f"Player ID {actor.get('player_id', '?')}", 80))
-        lines.append("UID: " + clean(actor.get("uid") or "невідомий", 100))
+        lines.append("[" + clean(actor.get("uid") or "UID невідомий", 100) + "]")
+        role = actor.get("role", "UNKNOWN")
+        if role in ("ADMIN", "GAME_MASTER", "PLAYER"):
+            lines.append("role=" + role)
+        if objects and "observation_count" in actor:
+            lines.append("Пов’язаних із callback гравця об’єктів: " + number(actor["observation_count"]))
     if len(actors) > 2:
         lines.append(f"Ще учасників у локальному записі: {len(actors) - 2}")
+    if auth_status == "gm_authorized":
+        operation = ("створення об’єктів" if objects else "вибухові пошкодження"
+                     if alert["rule"] == "explosive_damage_cluster" else "вибухові тригери")
+        lines.append("Підтверджена дія Game Master / адміністратора: " + operation)
+    else:
+        lines.append(LABELS.get(alert["rule"], clean(alert["rule"])))
+    if authority:
+        lines.append("authorization=" + auth_status.upper())
+        if auth_status == "gm_origin":
+            lines.append("Джерело походить із GM-спавну; дозвіл на цей ефект не підтверджено.")
+        if authority.get("sources_truncated"):
+            lines.append("Джерела GM скорочено; повні зв’язки — у raw-журналі.")
     if alert["rule"] == "movement_anomaly":
         lines.extend([
             f"distance={number(metrics.get('distance_m'))} m; time_delta={number(metrics.get('time_delta_s'))} s",
@@ -107,6 +174,22 @@ def payload_for(alert: dict, server_name: str) -> dict:
             "Звідки: " + position(metrics.get("from_position")),
             "Куди: " + position(metrics.get("to_position")),
         ])
+    elif objects:
+        lines.extend([
+            "count=" + number(metrics.get("count", alert.get("observation_count")))
+            + "; time_delta=" + number(metrics.get("time_delta_s")) + " s; window=" + number(metrics.get("window_s")) + " s",
+        ])
+        counts = metrics.get("object_counts")
+        if counts:
+            lines.append("; ".join(kind + "=" + number(counts[kind]) for kind in OBJECT_KINDS[:3]))
+        lines.append("OBSERVED_RATE=" + number(metrics.get("observed_rate_per_s")) + " /s")
+        lines.append("route_unknown=" + number(metrics.get("unknown_route_count"))
+                     + "; actor_unknown=" + number(metrics.get("unattributed_count")))
+        for row in metrics.get("prefabs", [])[:2]:
+            lines.append("Prefab: " + clean(row["prefab"] or "невідомий", 120) + " × " + number(row["count"]))
+        if metrics.get("prefabs_truncated") or len(metrics.get("prefabs", [])) > 2:
+            lines.append("Інші prefab — у локальному alert.")
+        lines.append("Координати: " + position(alert.get("position")))
     else:
         lines.append("Кількість спостережень: " + number(alert.get("observation_count")))
         lines.append("Координати: " + position(alert.get("position")))
@@ -114,13 +197,23 @@ def payload_for(alert: dict, server_name: str) -> dict:
     stamp = "н/д"
     if type(utc) is int and 0 <= utc <= 253402300799:
         stamp = datetime.fromtimestamp(utc, timezone.utc).isoformat()
-    lines.extend(["UTC: " + stamp, "Alert: " + clean(alert["alert_id"], 128),
-                  "Потрібна перевірка адміністратора. Це не доказ використання читів."])
+    footer = ["UTC: " + stamp, "Alert: " + clean(alert["alert_id"], 128),
+              "Потрібна перевірка адміністратора. Це не доказ використання читів."]
     if alert["rule"] == "movement_anomaly":
-        lines.append("Зазначено персонажа/водія; причина переміщення невідома.")
-    content = "\n".join(lines)
-    # Discord counts UTF-16 code units for limits. Leave headroom for Unicode.
-    content = content.encode("utf-16-le")[:3800].decode("utf-16-le", errors="ignore")
+        footer.append("Зазначено персонажа/водія; причина переміщення невідома.")
+    elif objects:
+        footer.append("Кількість стосується групи спостережень; це не доведений спавн одним гравцем.")
+        if alert["rule"] == "spatial_changes":
+            footer.append("Це нові спостереження: можливі рух або streaming, а не новий спавн.")
+    if auth_status == "gm_authorized":
+        footer.append("Дозвіл стосується записаної дії; зловживання повноваженнями перевіряються вручну.")
+    # Keep alert ID and the review caveat even with long Unicode names/prefabs.
+    tail = "\n" + "\n".join(footer)
+    budget = 3800 - len(tail.encode("utf-16-le"))
+    body = "\n".join(lines).encode("utf-16-le")
+    if len(body) > budget:
+        body = body[:budget - 2].decode("utf-16-le", errors="ignore").rstrip("\\").encode("utf-16-le") + "…".encode("utf-16-le")
+    content = body.decode("utf-16-le") + tail
     return {"username": "ConflictAudit", "content": content, "allowed_mentions": {"parse": []}}
 
 

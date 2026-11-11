@@ -19,6 +19,7 @@ class CA_Runtime
 	protected string m_Session;
 	protected string m_Path;
 	protected ref CA_MovementSampler m_Movement;
+	protected ref CA_AuthorityTracker m_Authority;
 
 	static CA_Runtime Get()
 	{
@@ -54,6 +55,7 @@ class CA_Runtime
 	{
 		m_StartTick = System.GetTickCount();
 		m_Movement = new CA_MovementSampler();
+		m_Authority = new CA_AuthorityTracker();
 		m_Session = string.Format("%1-%2-%3", System.GetUnixTime(), m_StartTick, Math.RandomInt(1, 1000000000));
 		FileIO.MakeDirectory("$profile:ConflictAudit");
 		SelectFile();
@@ -187,6 +189,7 @@ class CA_Runtime
 		{
 			event.actor_uid = m_Identity.Get(playerID);
 			event.actor_name = GetGame().GetPlayerManager().GetPlayerName(playerID);
+			event.actor_role = CA_AuthorityTracker.Role(playerID);
 		}
 		event.attribution = attribution;
 	}
@@ -206,7 +209,23 @@ class CA_Runtime
 		Enqueue(event);
 	}
 
-	void ObserveAction(IEntity entity, int playerID, string route)
+	void ObserveGMPlacement(IEntity entity, SCR_EditorManagerEntity manager, SCR_EditorModeEntity mode)
+	{
+		if (!Replication.IsServer() || !entity || !manager || m_StorageStopped)
+			return;
+		CA_GmSource context = m_Authority.Register(this, entity, manager, mode);
+		ObserveAction(entity, manager.GetPlayerID(), "editor_place", context);
+	}
+
+	// Invoke only inside the server FX generator after it creates this projectile.
+	bool RegisterGMEffectSource(IEntity projectile, IEntity authorizedGenerator)
+	{
+		if (!Replication.IsServer() || !m_Authority || m_StorageStopped)
+			return false;
+		return m_Authority.Link(this, projectile, authorizedGenerator);
+	}
+
+	void ObserveAction(IEntity entity, int playerID, string route, CA_GmSource authority = null)
 	{
 		if (!entity || entity.GetWorld() != GetGame().GetWorld() || m_StorageStopped)
 			return;
@@ -219,6 +238,7 @@ class CA_Runtime
 		Snapshot(event, entity);
 		event.deferredEntity = entity;
 		SetActor(event, playerID, "server_action_callback");
+		event.authority = authority;
 		Enqueue(event);
 	}
 
@@ -240,6 +260,7 @@ class CA_Runtime
 		event.source_entity = EntityKey(damage.damageSource);
 		if (damage.instigator)
 			SetActor(event, damage.instigator.GetInstigatorPlayerID(), "engine_instigator");
+		m_Authority.Capture(event, damage.damageSource);
 		Enqueue(event);
 	}
 
@@ -256,6 +277,7 @@ class CA_Runtime
 		Snapshot(event, entity);
 		if (instigator)
 			SetActor(event, instigator.GetInstigatorPlayerID(), "engine_instigator");
+		m_Authority.Capture(event, entity);
 		Enqueue(event);
 	}
 
@@ -277,6 +299,7 @@ class CA_Runtime
 			return;
 		// Drain before scanning to keep telemetry lag bounded during a spawn burst.
 		Flush(CA_Settings.MAX_EVENTS_PER_TICK);
+		m_Authority.Sweep(Now());
 		if (CA_Settings.MOVEMENT_ENABLED && m_Movement && !m_StorageStopped)
 			m_Movement.Sample(this);
 		if (CA_Settings.SCANNER_ENABLED && m_Queue.Count() < CA_Settings.MAX_QUEUE / 2)
@@ -324,6 +347,8 @@ class CA_Runtime
 			if (event.deferredEntity)
 				Snapshot(event, event.deferredEntity);
 			event.deferredEntity = null;
+			m_Authority.Resolve(event);
+			event.permissionCandidates = null;
 			event.seq = ++m_Sequence;
 			string line = event.Serialize(m_Session) + "\n";
 			int written = file.Write(line);

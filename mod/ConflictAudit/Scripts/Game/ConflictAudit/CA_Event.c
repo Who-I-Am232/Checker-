@@ -19,6 +19,8 @@ class CA_Settings
 	static const int MAX_MOVEMENT_PLAYERS = 256;
 	static const int MOVEMENT_GRACE_MS = 10000;
 	static const int MOVEMENT_MAX_GAP_MS = 2500;
+	static const int MAX_GM_SOURCES = 1024;
+	static const int GM_SOURCE_LIFETIME_MS = 60000;
 }
 
 class CA_Event
@@ -36,6 +38,7 @@ class CA_Event
 	int actor_id;
 	string actor_uid;
 	string actor_name;
+	string actor_role = "UNKNOWN";
 	string attribution = "unknown";
 	string source_entity;
 	float amount;
@@ -52,6 +55,8 @@ class CA_Event
 	// Temporary weak engine reference, never serialized. Used to obtain the final
 	// transform after spawning completes. Damage positions remain event-time values.
 	IEntity deferredEntity;
+	ref CA_GmSource authority;
+	ref array<IEntity> permissionCandidates;
 
 	string Serialize(string session)
 	{
@@ -73,11 +78,27 @@ class CA_Event
 		json.WriteValue("actor_id", actor_id);
 		json.WriteValue("actor_uid", actor_uid);
 		json.WriteValue("actor_name", actor_name);
+		json.WriteValue("actor_role", actor_role);
 		json.WriteValue("attribution", attribution);
 		json.WriteValue("source_entity", source_entity);
 		json.WriteValue("amount", amount);
 		json.WriteValue("count", count);
 		json.WriteValue("warmup", warmup);
+		if (authority)
+		{
+			string permission = "gm_authorized";
+			// Creating an object as GM does not authorize all its future uses.
+			if ((kind == "explosive_damage" || kind == "explosive_trigger") && authority.basis == "gm_editor")
+				permission = "gm_origin";
+			json.WriteValue("authorization", permission);
+			json.WriteValue("authorization_id", authority.actionID);
+			json.WriteValue("authorization_source", authority.basis);
+			json.WriteValue("authorization_entity", authority.rootID);
+			json.WriteValue("authorized_actor_id", authority.actorID);
+			json.WriteValue("authorized_actor_uid", authority.uid);
+			json.WriteValue("authorized_actor_name", authority.name);
+			json.WriteValue("authorized_actor_role", authority.role);
+		}
 		if (kind == "movement_candidate")
 		{
 			json.WriteValue("motion_mode", motion_mode);

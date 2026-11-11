@@ -44,6 +44,8 @@ class Config:
     movement_cooldown_ms: int = 30000
     allowed_prefabs: list[str] = field(default_factory=list)
     watch_prefabs: list[str] = field(default_factory=list)
+    building_prefabs: list[str] = field(default_factory=list)
+    vehicle_prefabs: list[str] = field(default_factory=list)
     spawn_categories: list[str] = field(default_factory=lambda: ["GENERIC", "UNCLASSIFIED", "VEHICLE"])
     known_routes: list[str] = field(default_factory=lambda: ["conflict_request", "editor_place"])
 
@@ -54,13 +56,15 @@ class Config:
             raise ValueError("Config must be an object with documented keys only")
         obj = cls(**values)
         for name, value in asdict(obj).items():
-            if name in {"allowed_prefabs", "watch_prefabs", "spawn_categories", "known_routes"}:
+            if name in {"allowed_prefabs", "watch_prefabs", "building_prefabs", "vehicle_prefabs", "spawn_categories", "known_routes"}:
                 if not isinstance(value, list) or len(value) > 2000 or any(not isinstance(v, str) or not v or len(v) > 1024 for v in value):
                     raise ValueError(f"Invalid string list: {name}")
             elif type(value) is not int or not 1 <= value <= 1000000:
                 raise ValueError(f"Invalid positive integer: {name}")
         if set(obj.allowed_prefabs) & set(obj.watch_prefabs):
             raise ValueError("A prefab cannot be both allowed and watched")
+        if set(obj.building_prefabs) & set(obj.vehicle_prefabs):
+            raise ValueError("A prefab cannot be classified as both building and vehicle")
         if obj.max_window_events < max(obj.spawn_threshold, obj.unattributed_threshold, obj.scan_threshold, obj.trigger_threshold, obj.damage_victims_threshold):
             raise ValueError("max_window_events is below a detection threshold")
         if obj.movement_min_delta_ms > obj.movement_max_delta_ms:
@@ -71,6 +75,12 @@ class Config:
 KINDS = {"session_start", "session_end", "heartbeat", "player_identity", "player_left",
          "entity_init", "placement", "scan_new", "scan_baseline", "scan_incomplete",
          "explosive_damage", "explosive_trigger", "telemetry_loss", "movement_candidate", "movement_reset"}
+SPAWN_RULES = {"spawn_burst", "unattributed_spawn_burst"}
+OBJECT_RULES = SPAWN_RULES | {"spatial_changes", "watched_prefab"}
+ROLES = ("UNKNOWN", "PLAYER", "ADMIN", "GAME_MASTER")
+AUTH_DEFAULTS = {"authorization": "unverified", "authorization_id": "", "authorization_source": "",
+                 "authorization_entity": "", "authorized_actor_id": 0, "authorized_actor_uid": "",
+                 "authorized_actor_name": "", "authorized_actor_role": "UNKNOWN"}
 
 
 def validate(raw: Any) -> dict[str, Any]:
@@ -92,6 +102,34 @@ def validate(raw: Any) -> dict[str, Any]:
             raise ValueError(f"Invalid {key}")
     if type(event.setdefault("warmup", False)) is not bool:
         raise ValueError("Invalid warmup flag")
+    if event.setdefault("actor_role", "UNKNOWN") not in ROLES:
+        raise ValueError("Invalid actor role")
+    for key, default in AUTH_DEFAULTS.items():
+        value = event.setdefault(key, default)
+        if key == "authorized_actor_id":
+            if type(value) is not int or not 0 <= value <= 2**31 - 1:
+                raise ValueError("Invalid authorized actor ID")
+        elif not isinstance(value, str) or len(value) > 2048:
+            raise ValueError("Invalid authorization field")
+    if event["authorization"] not in ("unverified", "gm_authorized", "gm_origin") or event["authorized_actor_role"] not in ROLES:
+        raise ValueError("Invalid authorization status or role")
+    if event["authorization"] != "unverified":
+        if (not event["authorization_id"] or not event["authorization_entity"] or not event["authorized_actor_uid"]
+                or event["authorized_actor_id"] <= 0 or event["authorized_actor_role"] not in ("ADMIN", "GAME_MASTER")
+                or event["authorization_source"] not in ("gm_editor", "gm_effect_link")):
+            raise ValueError("Incomplete GM provenance")
+        if event["kind"] == "placement":
+            if (event.get("source") != "editor_place" or event.get("attribution") != "server_action_callback"
+                    or event["actor_id"] != event["authorized_actor_id"]
+                    or event.get("actor_uid") != event["authorized_actor_uid"]
+                    or event.get("entity") != event["authorization_entity"] or event["authorization"] != "gm_authorized"):
+                raise ValueError("GM placement needs a matching server callback")
+        elif event["kind"] in {"explosive_damage", "explosive_trigger"}:
+            expected = "gm_authorized" if event["authorization_source"] == "gm_effect_link" else "gm_origin"
+            if event["authorization"] != expected:
+                raise ValueError("GM origin alone cannot authorize an explosion")
+        else:
+            raise ValueError("This observation cannot establish GM authorization")
     for key in ("source", "entity", "parent", "prefab", "category", "actor_uid", "actor_name", "attribution", "source_entity"):
         value = event.setdefault(key, "")
         if not isinstance(value, str) or len(value) > 2048:
@@ -280,28 +318,39 @@ class Analyzer:
                 continue
             e = dict(observation)
             action = self._action(s, e)
-            e.update(actor_id=0, actor_uid="", actor_name="", attribution="unknown")
+            e.pop("route", None)
+            e.pop("route_observation_seq", None)
+            e.update(actor_id=0, actor_uid="", actor_name="", actor_role="UNKNOWN", attribution="unknown", **AUTH_DEFAULTS)
             if action:
                 e["route_observation_seq"] = action["seq"]
                 e["route"] = action["source"]
-                for k in ("actor_id", "actor_uid", "actor_name", "attribution"):
+                for k in ("actor_id", "actor_uid", "actor_name", "actor_role", "attribution", *AUTH_DEFAULTS):
                     e[k] = action[k]
             self._watch(e)
-            self._window(s, e, "spawn_burst", self.config.spawn_window_ms, self.config.spawn_threshold,
-                         "Many initialized objects; even known construction routes need review at this rate", "medium")
+            # Prefer the more specific unknown-route warning if both rules cross
+            # their thresholds on this record. Both share one cell cooldown.
             if action is None:
                 self._window(s, e, "unattributed_spawn_burst", self.config.spawn_window_ms,
                              self.config.unattributed_threshold,
                              "Object burst without a matching instrumented placement route; custom mods can cause this", "medium")
+            self._window(s, e, "spawn_burst", self.config.spawn_window_ms, self.config.spawn_threshold,
+                         "Many initialized objects; even known construction routes need review at this rate", "medium")
+
+    @staticmethod
+    def _window_cooldown(key: tuple) -> tuple:
+        return ("spawn_activity", *key[1:]) if key[0] in SPAWN_RULES else key
 
     def _window(self, s: Session, e: dict, rule: str, duration: int, threshold: int, reason: str, severity: str) -> None:
         cell = (math.floor(e["x"] / self.config.cell_meters), math.floor(e["z"] / self.config.cell_meters))
-        key = (rule, *cell)
+        # Authorized actions must not inflate/suppress an unrelated player's
+        # warning in the same area. A GM-owned origin alone is not authorization.
+        permission_group = "gm_authorized" if e["authorization"] == "gm_authorized" else "unverified"
+        key = (rule, *cell, permission_group)
         bucket = s.windows.setdefault(key, deque())
         while len(s.windows) > self.config.max_windows:
             old_key = next(iter(s.windows))
             del s.windows[old_key]
-            s.cooldowns.pop(old_key, None)
+            s.cooldowns.pop(self._window_cooldown(old_key), None)
             self._coverage_once(s, e, "Spatial window budget exceeded")
         # Event-time comparisons tolerate buffered writes. Never compare across sessions.
         cutoff = e["t_ms"] - duration
@@ -313,9 +362,10 @@ class Analyzer:
             bucket.popleft()
             self._coverage_once(s, e, "Window event budget exceeded")
         relevant = [x for x in bucket if cutoff <= x["t_ms"] <= e["t_ms"]]
-        if len(relevant) < threshold or e["t_ms"] < s.cooldowns.get(key, -1):
+        cooldown_key = self._window_cooldown(key)
+        if len(relevant) < threshold or e["t_ms"] < s.cooldowns.get(cooldown_key, -1):
             return
-        s.cooldowns[key] = e["t_ms"] + self.config.cooldown_ms
+        s.cooldowns[cooldown_key] = e["t_ms"] + self.config.cooldown_ms
         self._alert(e, rule, severity, reason, relevant)
 
     def _coverage_once(self, s: Session, e: dict, reason: str) -> None:
@@ -333,7 +383,7 @@ class Analyzer:
         while len(s.windows) > self.config.max_windows:
             key = next(iter(s.windows))
             del s.windows[key]
-            s.cooldowns.pop(key, None)
+            s.cooldowns.pop(self._window_cooldown(key), None)
             self._coverage_once(s, e, "Spatial window budget exceeded")
 
     def _sweep(self, s: Session) -> None:
@@ -346,7 +396,37 @@ class Analyzer:
         s.windows = {k: v for k, v in s.windows.items() if v and s.now - v[-1]["t_ms"] <= keep}
         s.cooldowns = {k: v for k, v in s.cooldowns.items() if v >= s.now}
 
+    def _object_type(self, e: dict) -> str:
+        # GENERIC includes buildings and other objects; do not guess from a
+        # player's proximity or a prefab filename. Exact mappings are configurable.
+        if e["prefab"] in self.config.building_prefabs:
+            return "BUILDING"
+        if e["prefab"] in self.config.vehicle_prefabs or e["category"] == "VEHICLE":
+            return "VEHICLE"
+        return "ENTITY"
+
+    def _object_metrics(self, rule: str, evidence: list[dict]) -> dict:
+        counts = {"VEHICLE": 0, "BUILDING": 0, "ENTITY": 0}
+        prefabs: dict[str, int] = {}
+        for item in evidence:
+            counts[self._object_type(item)] += 1
+            prefabs[item["prefab"]] = prefabs.get(item["prefab"], 0) + 1
+        kinds = [kind for kind, count in counts.items() if count]
+        delta = (max(x["t_ms"] for x in evidence) - min(x["t_ms"] for x in evidence)) / 1000
+        return {
+            "object_kind": kinds[0] if len(kinds) == 1 else "MIXED",
+            "object_counts": counts, "count": len(evidence), "time_delta_s": delta,
+            "window_s": self.config.spawn_window_ms / 1000 if rule != "watched_prefab" else None,
+            "observed_rate_per_s": round(len(evidence) / delta, 3) if delta > 0 else None,
+            "unknown_route_count": sum(not x.get("route") for x in evidence),
+            "unattributed_count": sum(x["actor_id"] <= 0 or x["attribution"] != "server_action_callback" for x in evidence),
+            "prefabs": [{"prefab": name, "count": count} for name, count in sorted(prefabs.items(), key=lambda p: (-p[1], p[0]))[:8]],
+            "prefabs_truncated": len(prefabs) > 8,
+        }
+
     def _alert(self, e: dict, rule: str, severity: str, reason: str, evidence: list[dict], metrics: dict | None = None) -> None:
+        if rule in OBJECT_RULES:
+            metrics = self._object_metrics(rule, evidence)
         seqs = sorted({item["seq"] for item in evidence})
         token = json.dumps([e["session"], rule, seqs], separators=(",", ":"))
         actors: dict[tuple, dict] = {}
@@ -357,7 +437,8 @@ class Analyzer:
                 continue
             key = (item["actor_id"], item["actor_uid"], item["attribution"])
             actors[key] = {"player_id": item["actor_id"], "uid": item["actor_uid"],
-                           "name": item["actor_name"], "basis": item["attribution"]}
+                           "name": item["actor_name"], "basis": item["attribution"], "role": item["actor_role"],
+                           **({"observation_count": actors.get(key, {}).get("observation_count", 0) + 1} if rule in OBJECT_RULES else {})}
         alert = {
             "schema": 1, "alert_id": hashlib.sha256(token.encode()).hexdigest()[:20],
             "session": e["session"], "rule": rule, "severity": severity,
@@ -372,7 +453,28 @@ class Analyzer:
         }
         if metrics is not None:
             alert["metrics"] = metrics
+        if rule not in {"coverage_gap", "sequence_gap", "collector_silent"}:
+            approved = sum(item["authorization"] == "gm_authorized" for item in evidence)
+            related = sum(item["authorization"] == "gm_origin" for item in evidence)
+            state = "gm_authorized" if approved == len(evidence) else "mixed" if approved else "gm_origin" if related else "unverified"
+            sources = {}
+            for item in evidence:
+                if item["authorization"] == "unverified":
+                    continue
+                key = (item["authorization_id"], item["authorization_source"])
+                sources[key] = {"action_id": item["authorization_id"], "basis": item["authorization_source"],
+                                "entity": item["authorization_entity"], "player_id": item["authorized_actor_id"],
+                                "uid": item["authorized_actor_uid"], "name": item["authorized_actor_name"],
+                                "role": item["authorized_actor_role"]}
+            alert["authorization"] = {"status": state, "authorized_count": approved, "gm_origin_count": related,
+                                      "unverified_count": len(evidence) - approved, "sources": list(sources.values())[:8],
+                                      "sources_truncated": len(sources) > 8}
+            if state == "gm_authorized":
+                alert["severity"] = "info"
+        if rule == "movement_anomaly":
             alert["actor_caution"] = "Movement identifies the observed character/driver, not the cause of the displacement or cheat software."
+        elif rule in OBJECT_RULES:
+            alert["actor_caution"] = "Counts describe observed objects, not proven illegal spawns. Each reported actor is linked only to their own server callbacks."
         self.alert_count += 1
         self.emit(alert)
 

@@ -23,6 +23,8 @@
   "movement_cooldown_ms": 30000,
   "allowed_prefabs": [],
   "watch_prefabs": [],
+  "building_prefabs": [],
+  "vehicle_prefabs": [],
   "spawn_categories": ["GENERIC", "UNCLASSIFIED", "VEHICLE"],
   "known_routes": ["conflict_request", "editor_place"]
 }

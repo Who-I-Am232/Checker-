@@ -14,6 +14,7 @@
 | `x`, `y`, `z` | Світові координати в метрах; Y — висота |
 | `actor_id` | Повідомлений session player ID, 0 — невідомий |
 | `actor_uid`, `actor_name` | Тільки коли доступне доречне серверне зіставлення; можуть бути порожні |
+| `actor_role` | ADMIN, GAME_MASTER, PLAYER або UNKNOWN; знімок серверної ролі, не дозвіл на всі дії |
 | `attribution` | unknown, server_action_callback, engine_instigator, identity_only, server_movement_sample |
 | `source_entity` | ID джерела damage або контрольованого персонажа для movement |
 | `amount` | damageValue контексту, не гарантована остаточна втрата health |
@@ -73,3 +74,39 @@ server-side файл може підробити будь-яку записан�
 Discord payload не є raw-доказом. Він містить короткий виклад і `alert_id`;
 повна кореляція доступна в локальному alert і raw-файлі. `server-id` задається
 під час запуску notifier та разом з `alert_id` утворює ключ дедуплікації.
+
+## Спавн та типи об'єктів
+
+Правила spawn_burst, unattributed_spawn_burst, spatial_changes і watched_prefab
+додають `metrics`: `object_kind` (VEHICLE/BUILDING/ENTITY/MIXED), `object_counts`,
+`count`, фактичний `time_delta_s`, задане `window_s`, `observed_rate_per_s`,
+`unknown_route_count`, `unattributed_count`, до 8 пар prefab/count та прапорець
+`prefabs_truncated`. Для watchlist window відсутнє (`null`); rate за delta=0 теж
+`null`. У reported_actors цих правил є власний observation_count гравця.
+
+Типи будівель/нестандартної техніки визначаються точними мапінгами конфігурації,
+решта — через категорію VEHICLE або fallback ENTITY. Назва файла не використовується
+як доказ, що об'єкт є будівлею. Приклад: `examples/alerts-spawn.jsonl`.
+
+## Походження адміністративної дії
+
+Raw-подія може додавати `authorization` (`gm_authorized`/`gm_origin`),
+`authorization_id`, `authorization_source` (`gm_editor`/`gm_effect_link`),
+`authorization_entity`, `authorized_actor_id`, `authorized_actor_uid`,
+`authorized_actor_name`, `authorized_actor_role`. За відсутності цих полів
+статус — unverified. Placement вимагає збігу actor ID/UID та ID об'єкта з
+контекстом дозволу, джерело editor_place і server_action_callback.
+
+Авторизований init отримує контекст лише після кореляції з placement. Для
+вибуху gm_editor дає тільки gm_origin; gm_authorized потребує gm_effect_link.
+Статус рольового гравця з engine_instigator навмисно не визначається з
+поточного player slot. Джерело GM має окремий знімок виконавця початкової дії.
+
+Alert містить object `authorization`: status, authorized_count, gm_origin_count,
+unverified_count, до 8 sources і sources_truncated. gm_origin_count є частиною
+unverified_count. Sources містять action_id, basis, entity та знімок виконавця.
+Якщо всі спостереження підтверджені — severity info; verdict лишається
+needs_human_review. UNVERIFIED не означає, що дія заборонена або що гравець читер.
+Операційні попередження втрати телеметрії не успадковують дозвіл останньої дії.
+
+Деталі та межі довіри: [ADMIN_ACTIONS_UK.md](ADMIN_ACTIONS_UK.md).

@@ -58,11 +58,11 @@ modded class SCR_PlacingEditorComponent
 		if (!Replication.IsServer() || !CA_Runtime.Get() || !GetManager())
 			return;
 		// Read the server's manager, not an arbitrary playerID from an RPC payload.
-		int actor = GetManager().GetPlayerID();
+		SCR_EditorModeEntity mode = SCR_EditorModeEntity.Cast(GetOwner());
 		foreach (SCR_EditableEntityComponent editable : entities)
 		{
 			if (editable)
-				CA_Runtime.Get().ObserveAction(editable.GetOwner(), actor, "editor_place");
+				CA_Runtime.Get().ObserveGMPlacement(editable.GetOwner(), GetManager(), mode);
 		}
 	}
 }
